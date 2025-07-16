@@ -3,8 +3,17 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from sensor_msgs.msg import JointState
-from PySide6.QtWidgets import QApplication, QWidget, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import (
+    QApplication, 
+    QWidget, 
+    QPushButton, 
+    QVBoxLayout,
+    QSlider,
+    QLabel,
+    QHBoxLayout
+)
 from PySide6.QtCore import QThread
+from PySide6.QtCore import Qt
 
 from controller_manager_msgs.srv import ListControllers
 from controller_manager_msgs.srv import SwitchController
@@ -13,13 +22,48 @@ from controller_manager_msgs.srv import SwitchController
 class JointControllerGui(Node):
     def __init__(self):
         super().__init__('minimal_publisher')
+
+        # Define publishers
         self.publisher_ = self.create_publisher(String, 'topic', 10)
+
+        # Define subscriber to joint states
+        self.joint_state_sub = self.create_subscription(
+            JointState, "/joint_states", self.joint_state_callback, 10
+        )
 
         # Create Client to get ros2 controllers state
         self.list_controllers_client = \
             self.create_client(ListControllers, '/controller_manager/list_controllers')
         
-        self.controllers_list = []
+        self.controllers = []
+        self.joint_names = []
+        self.sliders = []
+        self.joint_name_to_slider = {}
+
+        self.gui_ready = False
+
+    def joint_state_callback(self, msg: JointState):
+        if not self.gui_ready:
+            self.joint_names = msg.name
+            self.create_sliders()
+            self.gui_ready = True
+
+    def create_sliders(self):
+        for name in self.joint_names:
+            row = QHBoxLayout()
+            label = QLabel(name)
+            slider = SmartSlider(Qt.Horizontal)
+            slider.setMinimum(-100)
+            slider.setMaximum(100)
+            slider.setValue(0)
+            slider.setTickInterval(1)
+            slider.setTickPosition(QSlider.TicksBelow)
+            slider.valueChanged.connect(self.publish_message)
+            self.sliders.append(slider)
+            self.joint_name_to_slider[name] = slider
+            row.addWidget(label)
+            row.addWidget(slider)
+            # self.layout.addLayout(row)
 
     def publish_message(self, msg: str):
         msg_obj = String()
@@ -38,9 +82,9 @@ class JointControllerGui(Node):
     def on_controllers_response(self, future):
         try:
             response = future.result()
-            self.controllers_list.clear()
+            self.controllers.clear()
             for controller in response.controller:
-                self.controllers_list.append(controller)
+                self.controllers.append(controller)
                 self.get_logger().info(f"Controller: {controller.name}, State: {controller.state}")
         except Exception as e:
             self.get_logger().error(f"Service call failed: {e}")
@@ -60,6 +104,16 @@ class RosSpinThread(QThread):
         self.quit()
         self.wait()
 
+
+class SmartSlider(QSlider):
+    """Custom QSlider that resets value to zero on mouse release."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def mouseReleaseEvent(self, event):
+        self.setValue(0)  # Reset to zero
+        super().mouseReleaseEvent(event)
 
 # Main GUI
 class MainWindow(QWidget):
