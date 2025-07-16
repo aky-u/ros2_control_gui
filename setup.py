@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'joint_controller_gui = ros2_control_gui.joint_controller_gui:main',
         ],
     },
 )
