@@ -1,58 +1,57 @@
-# -*- encoding: shift-jis -*-
 import PySide6
 from PySide6.QtWidgets import (QApplication,
-                               QPushButton,     # ボタンを使うのに必要
+                               QPushButton,     # Required to use buttons
                                QWidget)
 import os
 import sys
 
 
-# PySide6のアプリ本体（ユーザがコーディングしていく部分）
+# Main PySide6 application (user-defined part)
 class MainWindow(QWidget):
     def __init__(self, parent=None):
-        # 親クラスの初期化
+        # Initialize parent class
         super().__init__(parent)
         
-        # ウィンドウタイトル
-        self.setWindowTitle("PySide6で作ったアプリです。")
+        # Window title
+        self.setWindowTitle("This is an app made with PySide6.")
         
-        # ボタンを表示するメソッド
+        # Display the button
         self.SetButton()
         
-    # ボタンは別のメソッドに分けました
+    # Separated button setup into its own method
     def SetButton(self):
-        # ボタンを使うことを宣言
+        # Declare the button
         button = QPushButton(self)
         
-        # ボタンに表示する文字
-        button.setText("押してみよう！！")
+        # Set text on the button
+        button.setText("Try pressing me!!")
         
-        # ボタンを押したら実行させる処理
-        # connectメソッド: 処理させるメソッド
+        # Action when the button is pressed
+        # Use the connect method to bind to the handler
         button.pressed.connect(self.CallbackButtonPressed)
         
-        # ボタンを離したら実行させる処理（引数を指定する場合）
-        # connectメソッド: 処理させるメソッド
+        # Action when the button is released (with argument)
+        # Use lambda to pass arguments
         button.released.connect(lambda: self.CallbackButtonReleased(90))
         
-    # ボタンが押されたら実行させるメソッド
-    # connectメソッドから呼び出される
+    # Method executed when the button is pressed
+    # Called via connect method
     def CallbackButtonPressed(self):
         print("akiyoshi!")
         
-    # ボタンが離されたら実行させるメソッド（引数あり）
-    # connectメソッドから呼び出される
+    # Method executed when the button is released (with argument)
+    # Called via connect method
     def CallbackButtonReleased(self, radian):
-        print("横向くんだよ" + str(radian) + "度！")
+        print("Turn to the side " + str(radian) + " degrees!")
 
 
 if __name__ == "__main__":
-    # 環境変数にPySide6を登録
+    # Set PySide6 plugin path in environment variable
     dirname = os.path.dirname(PySide6.__file__)
     plugin_path = os.path.join(dirname, 'plugins', 'platforms')
     os.environ['QT_QPA_PLATFORM_PLUGIN_PATH'] = plugin_path
     
-    app = QApplication(sys.argv)    # PySide6の実行
-    window = MainWindow()           # ユーザがコーディングしたクラス
-    window.show()                   # PySide6のウィンドウを表示
-    sys.exit(app.exec())            # PySide6の終了
+    app = QApplication(sys.argv)    # Run PySide6
+    window = MainWindow()           # Instantiate the user-defined class
+    window.show()                   # Show the PySide6 window
+    sys.exit(app.exec())            # Exit PySide6
