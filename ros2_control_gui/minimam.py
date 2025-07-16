@@ -42,7 +42,7 @@ class MainWindow(QWidget):
     # Method executed when the button is released (with argument)
     # Called via connect method
     def CallbackButtonReleased(self, radian):
-        print("Turn to the side " + str(radian) + " degrees!")
+        print("uchda!")
 
 
 if __name__ == "__main__":
