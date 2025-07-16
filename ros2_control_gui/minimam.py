@@ -7,7 +7,7 @@ import sys
 
 
 # Main PySide6 application (user-defined part)
-class MainWindow(QWidget):
+class MainWindow(QWidget.QmainWindow):
     def __init__(self, parent=None):
         # Initialize parent class
         super().__init__(parent)
