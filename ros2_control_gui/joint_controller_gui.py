@@ -10,9 +10,10 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
     QHBoxLayout, QLabel, QSlider, QDialog, QListWidget,
-    QListWidgetItem, QSpinBox, QDoubleSpinBox, QGroupBox
+    QListWidgetItem, QSpinBox, QDoubleSpinBox, QGroupBox,
+    QCheckBox
 )
-from PySide6.QtCore import QThread, Qt, QObject, Signal
+from PySide6.QtCore import QThread, Qt, QObject, Signal, QTimer
 
 
 # Signal class for Qt-safe updates
@@ -251,6 +252,10 @@ class MainWindow(QWidget):
         self.sliders = {}
         self.current_controller = None
         self.current_controller_info = None
+        
+        # Continuous command timer
+        self.continuous_timer = QTimer()
+        self.continuous_timer.timeout.connect(self.send_continuous_command)
 
         # Controller selection section
         controller_group = QGroupBox("Controller Selection")
@@ -269,6 +274,30 @@ class MainWindow(QWidget):
         
         controller_group.setLayout(controller_layout)
         self.layout.addWidget(controller_group)
+
+        # Continuous command section
+        continuous_group = QGroupBox("Continuous Command Settings")
+        continuous_layout = QHBoxLayout()
+        
+        # Continuous checkbox
+        self.continuous_checkbox = QCheckBox("Send Continuous")
+        self.continuous_checkbox.toggled.connect(self.on_continuous_toggled)
+        continuous_layout.addWidget(self.continuous_checkbox)
+        
+        # Frequency setting
+        freq_label = QLabel("Frequency (Hz):")
+        continuous_layout.addWidget(freq_label)
+        
+        self.frequency_spinbox = QDoubleSpinBox()
+        self.frequency_spinbox.setRange(0.1, 100.0)
+        self.frequency_spinbox.setValue(10.0)
+        self.frequency_spinbox.setSingleStep(0.5)
+        self.frequency_spinbox.setDecimals(1)
+        self.frequency_spinbox.valueChanged.connect(self.on_frequency_changed)
+        continuous_layout.addWidget(self.frequency_spinbox)
+        
+        continuous_group.setLayout(continuous_layout)
+        self.layout.addWidget(continuous_group)
 
         # Joint control section
         self.joint_group = QGroupBox("Joint Control")
@@ -299,6 +328,31 @@ class MainWindow(QWidget):
 
         # Auto-request controllers on startup
         self.ros_node.request_controllers()
+
+    def on_continuous_toggled(self, checked: bool):
+        """Handle continuous mode toggle"""
+        if checked:
+            frequency = self.frequency_spinbox.value()
+            interval_ms = int(1000 / frequency)
+            self.continuous_timer.start(interval_ms)
+            self.command_button.setText("Stop Continuous")
+            self.get_logger().info(f"Continuous mode started at {frequency} Hz")
+        else:
+            self.continuous_timer.stop()
+            self.command_button.setText("Send Command")
+            self.get_logger().info("Continuous mode stopped")
+
+    def on_frequency_changed(self, frequency: float):
+        """Handle frequency change"""
+        if self.continuous_timer.isActive():
+            interval_ms = int(1000 / frequency)
+            self.continuous_timer.start(interval_ms)  # Restart with new interval
+            self.get_logger().info(f"Frequency changed to {frequency} Hz")
+
+    def send_continuous_command(self):
+        """Send command in continuous mode"""
+        if self.current_controller and self.current_controller_info:
+            self.send_command()
 
     def show_controller_dialog(self):
         self.ros_node.request_controllers()
@@ -378,8 +432,18 @@ class MainWindow(QWidget):
             lambda v, lbl=value_label: lbl.setText(f"{v/100:.3f}")
         )
         
+        # Connect mouse release event for auto-reset in continuous mode
+        slider.sliderReleased.connect(
+            lambda s=slider: self.on_slider_released(s)
+        )
+        
         self.joint_layout.addLayout(row)
         self.sliders[joint_name] = {'slider': slider, 'label': value_label, 'index': index}
+
+    def on_slider_released(self, slider: QSlider):
+        """Handle slider release - reset to zero if in continuous mode"""
+        if self.continuous_checkbox.isChecked():
+            slider.setValue(0)
 
     def update_joint_sliders(self, joint_data: dict):
         """Update slider background colors to show current joint states"""
@@ -403,6 +467,16 @@ class MainWindow(QWidget):
         # Send command to ROS node
         self.ros_node.send_joint_command(joint_positions)
 
+    def get_logger(self):
+        """Helper method to access ROS logger"""
+        return self.ros_node.get_logger()
+
+    def closeEvent(self, event):
+        """Handle window close event"""
+        if self.continuous_timer.isActive():
+            self.continuous_timer.stop()
+        event.accept()
+
 
 def main():
     rclpy.init()
@@ -413,7 +487,7 @@ def main():
 
     app = QApplication(sys.argv)
     window = MainWindow(ros_node)
-    window.resize(800, 600)
+    window.resize(800, 700)
     window.show()
 
     try:
