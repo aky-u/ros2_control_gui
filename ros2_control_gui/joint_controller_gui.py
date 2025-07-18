@@ -20,6 +20,7 @@ class GuiSignals(QObject):
     joint_state_updated = Signal(dict)  # {joint_name: position}
     controllers_received = Signal(list)  # [(name, state)]
     controller_selected = Signal(str)  # controller_name
+    controller_info_received = Signal(dict)  # controller configuration
 
 
 # ROS 2 Node
@@ -38,13 +39,14 @@ class JointControllerNode(Node):
         self.gui_signals = GuiSignals()
         self.command_publishers = {}
         self.current_controller = None
+        self.current_controller_info = None
         self.joint_names = []
 
     def joint_state_callback(self, msg: JointState):
         joint_data = dict(zip(msg.name, msg.position))
         self.gui_signals.joint_state_updated.emit(joint_data)
         
-        # Store joint names for commanding
+        # Store joint names for reference
         if not self.joint_names:
             self.joint_names = list(msg.name)
 
@@ -68,31 +70,81 @@ class JointControllerNode(Node):
         except Exception as e:
             self.get_logger().error(f"Service call failed: {e}")
 
+    def discover_controller_info(self, controller_name: str):
+        """Discover controller information using topic introspection"""
+        # Get all topics and their types
+        topic_names_and_types = self.get_topic_names_and_types()
+        
+        # Find command topics for this controller
+        command_topics = []
+        for topic_name, topic_types in topic_names_and_types:
+            if controller_name in topic_name and ('command' in topic_name or 'trajectory' in topic_name):
+                command_topics.append((topic_name, topic_types[0]))
+        
+        # Determine controller type based on topic names and types
+        controller_type = "unknown"
+        if any('trajectory' in topic for topic, _ in command_topics):
+            controller_type = "joint_trajectory_controller"
+        elif any('command' in topic for topic, _ in command_topics):
+            controller_type = "position_controller"
+        
+        # Create controller info structure
+        controller_info = {
+            'name': controller_name,
+            'type': controller_type,
+            'command_topics': command_topics,
+            'joint_names': self.joint_names  # Use joint names from joint_states
+        }
+        
+        self.current_controller_info = controller_info
+        self.gui_signals.controller_info_received.emit(controller_info)
+
     def select_controller(self, controller_name: str):
         """Select and setup publisher for the chosen controller"""
         self.current_controller = controller_name
+        
+        # Discover controller info using topic introspection
+        self.discover_controller_info(controller_name)
+
+    def setup_publisher(self, controller_info: dict):
+        """Setup publisher based on controller configuration"""
+        controller_name = controller_info['name']
         
         # Destroy existing publisher if any
         if controller_name in self.command_publishers:
             self.command_publishers[controller_name].destroy()
         
-        # Create appropriate publisher based on controller type
-        if 'joint_trajectory_controller' in controller_name or 'trajectory' in controller_name:
-            topic = f"/{controller_name}/joint_trajectory"
-            self.command_publishers[controller_name] = self.create_publisher(
-                JointTrajectory, topic, 10
-            )
+        # Determine the appropriate topic and message type
+        command_topics = controller_info.get('command_topics', [])
+        
+        if command_topics:
+            topic_name, message_type = command_topics[0]
+            
+            if 'trajectory_msgs/msg/JointTrajectory' in message_type:
+                self.command_publishers[controller_name] = self.create_publisher(
+                    JointTrajectory, topic_name, 10
+                )
+            elif 'std_msgs/msg/Float64MultiArray' in message_type:
+                self.command_publishers[controller_name] = self.create_publisher(
+                    Float64MultiArray, topic_name, 10
+                )
         else:
-            # For position/velocity/effort controllers
-            topic = f"/{controller_name}/commands"
-            self.command_publishers[controller_name] = self.create_publisher(
-                Float64MultiArray, topic, 10
-            )
+            # Fallback to naming convention
+            if 'joint_trajectory_controller' in controller_name or 'trajectory' in controller_name:
+                topic = f"/{controller_name}/joint_trajectory"
+                self.command_publishers[controller_name] = self.create_publisher(
+                    JointTrajectory, topic, 10
+                )
+            else:
+                topic = f"/{controller_name}/commands"
+                self.command_publishers[controller_name] = self.create_publisher(
+                    Float64MultiArray, topic, 10
+                )
         
         self.get_logger().info(f"Selected controller: {controller_name}")
         self.gui_signals.controller_selected.emit(controller_name)
 
-    def send_joint_command(self, joint_positions: dict):
+    def send_joint_command(self, joint_positions: list):
         """Send command to the selected controller"""
         if not self.current_controller or self.current_controller not in self.command_publishers:
             self.get_logger().warn("No controller selected or publisher not ready")
@@ -100,23 +152,34 @@ class JointControllerNode(Node):
 
         publisher = self.command_publishers[self.current_controller]
         
-        if 'joint_trajectory_controller' in self.current_controller or 'trajectory' in self.current_controller:
+        # Determine message type based on controller info
+        is_trajectory = False
+        if self.current_controller_info:
+            command_topics = self.current_controller_info.get('command_topics', [])
+            if command_topics:
+                _, message_type = command_topics[0]
+                is_trajectory = 'trajectory_msgs/msg/JointTrajectory' in message_type
+            else:
+                is_trajectory = 'joint_trajectory_controller' in self.current_controller or 'trajectory' in self.current_controller
+        
+        if is_trajectory:
             # Send JointTrajectory message
             msg = JointTrajectory()
             msg.header.stamp = self.get_clock().now().to_msg()
-            msg.joint_names = list(joint_positions.keys())
+            
+            # Use joint names from joint_states
+            msg.joint_names = self.joint_names[:len(joint_positions)]
             
             point = JointTrajectoryPoint()
-            point.positions = list(joint_positions.values())
-            point.time_from_start.sec = 1  # 1 second to reach target
+            point.positions = joint_positions
+            point.time_from_start.sec = 1
             msg.points = [point]
             
             publisher.publish(msg)
         else:
             # Send Float64MultiArray message
             msg = Float64MultiArray()
-            # Ensure positions are in the same order as joint_names
-            msg.data = [joint_positions.get(name, 0.0) for name in self.joint_names]
+            msg.data = joint_positions
             publisher.publish(msg)
 
         self.get_logger().info(f"Command sent to {self.current_controller}: {joint_positions}")
@@ -150,7 +213,7 @@ class ControllersDialog(QDialog):
         self.list_widget = QListWidget()
         for name, state in controllers:
             item = QListWidgetItem(f"{name}  [{state}]")
-            item.setData(Qt.UserRole, name)  # Store controller name
+            item.setData(Qt.UserRole, name)
             self.list_widget.addItem(item)
         
         self.list_widget.itemDoubleClicked.connect(self.on_item_selected)
@@ -187,6 +250,7 @@ class MainWindow(QWidget):
         self.layout = QVBoxLayout(self)
         self.sliders = {}
         self.current_controller = None
+        self.current_controller_info = None
 
         # Controller selection section
         controller_group = QGroupBox("Controller Selection")
@@ -199,6 +263,10 @@ class MainWindow(QWidget):
         select_button.clicked.connect(self.show_controller_dialog)
         controller_layout.addWidget(select_button)
         
+        # Controller info display
+        self.controller_info_label = QLabel("No controller info")
+        controller_layout.addWidget(self.controller_info_label)
+        
         controller_group.setLayout(controller_layout)
         self.layout.addWidget(controller_group)
 
@@ -206,7 +274,7 @@ class MainWindow(QWidget):
         self.joint_group = QGroupBox("Joint Control")
         self.joint_layout = QVBoxLayout()
         self.joint_group.setLayout(self.joint_layout)
-        self.joint_group.setEnabled(False)  # Disabled until controller selected
+        self.joint_group.setEnabled(False)
         self.layout.addWidget(self.joint_group)
 
         # Command button
@@ -224,6 +292,9 @@ class MainWindow(QWidget):
         )
         self.ros_node.gui_signals.controller_selected.connect(
             self.handle_controller_selected
+        )
+        self.ros_node.gui_signals.controller_info_received.connect(
+            self.handle_controller_info_received
         )
 
         # Auto-request controllers on startup
@@ -244,57 +315,95 @@ class MainWindow(QWidget):
     def handle_controller_selected(self, controller_name: str):
         self.current_controller = controller_name
         self.controller_label.setText(f"Selected: {controller_name}")
+
+    def handle_controller_info_received(self, controller_info: dict):
+        """Handle controller configuration and setup UI accordingly"""
+        self.current_controller_info = controller_info
+        
+        # Display controller info
+        info_text = f"Type: {controller_info['type']}\n"
+        info_text += f"Joint Names: {len(controller_info['joint_names'])}\n"
+        info_text += f"Command Topics: {controller_info.get('command_topics', [])}"
+        self.controller_info_label.setText(info_text)
+        
+        # Setup publisher
+        self.ros_node.setup_publisher(controller_info)
+        
+        # Clear existing sliders
+        self.clear_sliders()
+        
+        # Create sliders based on joint names
+        joint_names = controller_info['joint_names']
+        for i, joint_name in enumerate(joint_names):
+            self.create_slider(joint_name, i)
+        
         self.joint_group.setEnabled(True)
         self.command_button.setEnabled(True)
 
+    def clear_sliders(self):
+        """Clear all existing sliders"""
+        for widgets in self.sliders.values():
+            widgets['slider'].deleteLater()
+            widgets['label'].deleteLater()
+        self.sliders.clear()
+        
+        # Clear layout
+        while self.joint_layout.count():
+            child = self.joint_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+    def create_slider(self, joint_name: str, index: int):
+        """Create a slider for a joint"""
+        row = QHBoxLayout()
+        
+        # Joint name label
+        label = QLabel(f"{joint_name}:")
+        label.setMinimumWidth(150)
+        row.addWidget(label)
+        
+        # Command slider
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(-314, 314)  # -3.14 to 3.14 radians * 100
+        slider.setValue(0)
+        row.addWidget(slider)
+        
+        # Value display
+        value_label = QLabel("0.000")
+        value_label.setMinimumWidth(60)
+        row.addWidget(value_label)
+        
+        # Connect slider to value update
+        slider.valueChanged.connect(
+            lambda v, lbl=value_label: lbl.setText(f"{v/100:.3f}")
+        )
+        
+        self.joint_layout.addLayout(row)
+        self.sliders[joint_name] = {'slider': slider, 'label': value_label, 'index': index}
+
     def update_joint_sliders(self, joint_data: dict):
-        for name, position in joint_data.items():
-            if name not in self.sliders:
-                row = QHBoxLayout()
-                
-                # Joint name label
-                label = QLabel(f"{name}:")
-                label.setMinimumWidth(100)
-                row.addWidget(label)
-                
-                # Position slider
-                slider = QSlider(Qt.Horizontal)
-                slider.setRange(-314, 314)  # approx. -3.14 to 3.14 radians * 100
-                slider.setValue(int(position * 100))
-                row.addWidget(slider)
-                
-                # Position value display
-                value_label = QLabel(f"{position:.3f}")
-                value_label.setMinimumWidth(60)
-                row.addWidget(value_label)
-                
-                # Connect slider to value update
-                slider.valueChanged.connect(
-                    lambda v, lbl=value_label: lbl.setText(f"{v/100:.3f}")
-                )
-                
-                self.joint_layout.addLayout(row)
-                self.sliders[name] = {'slider': slider, 'label': value_label}
-            else:
-                # Update existing slider
-                self.sliders[name]['slider'].setValue(int(position * 100))
-                self.sliders[name]['label'].setText(f"{position:.3f}")
+        """Update slider background colors to show current joint states"""
+        # Optional: Update slider tooltips or background to show current position
+        pass
 
     def send_command(self):
-        if not self.current_controller:
+        if not self.current_controller or not self.current_controller_info:
             return
             
-        # Get current slider values
-        joint_positions = {}
-        for name, widgets in self.sliders.items():
-            position = widgets['slider'].value() / 100.0
-            joint_positions[name] = position
+        # Get current slider values in the correct order
+        joint_names = self.current_controller_info['joint_names']
+        joint_positions = [0.0] * len(joint_names)
+        
+        for joint_name, widgets in self.sliders.items():
+            if joint_name in joint_names:
+                position = widgets['slider'].value() / 100.0
+                index = joint_names.index(joint_name)
+                joint_positions[index] = position
         
         # Send command to ROS node
         self.ros_node.send_joint_command(joint_positions)
 
 
-# Main function
 def main():
     rclpy.init()
 
