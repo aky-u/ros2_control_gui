@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
     QHBoxLayout, QLabel, QSlider, QDialog, QListWidget,
     QListWidgetItem, QSpinBox, QDoubleSpinBox, QGroupBox,
-    QCheckBox
+    QCheckBox, QMessageBox
 )
 from PySide6.QtCore import QThread, Qt, QObject, Signal, QTimer
 
@@ -22,6 +22,7 @@ class GuiSignals(QObject):
     controllers_received = Signal(list)  # [(name, type, state)]
     controller_selected = Signal(str)  # controller_name
     controller_info_received = Signal(dict)  # controller configuration
+    service_error = Signal(str)  # Error message
 
 
 # ROS 2 Node
@@ -42,6 +43,8 @@ class JointControllerNode(Node):
         self.current_controller = None
         self.current_controller_info = None
         self.joint_names = []
+        self.service_in_progress = False
+        self.controller_types = {}  # Store controller types from service
 
     def joint_state_callback(self, msg: JointState):
         joint_data = dict(zip(msg.name, msg.position))
@@ -52,98 +55,158 @@ class JointControllerNode(Node):
             self.joint_names = list(msg.name)
 
     def request_controllers(self):
+        if self.service_in_progress:
+            self.get_logger().warn("Service call already in progress, please wait...")
+            return False
+
         if not self.list_controllers_client.service_is_ready():
             self.get_logger().info("Waiting for list_controllers service...")
-            return
+            self.gui_signals.service_error.emit("Controller manager service not ready. Please wait...")
+            return False
 
-        request = ListControllers.Request()
-        future = self.list_controllers_client.call_async(request)
-        future.add_done_callback(self.handle_controller_response)
+        try:
+            self.service_in_progress = True
+            request = ListControllers.Request()
+            future = self.list_controllers_client.call_async(request)
+            future.add_done_callback(self.handle_controller_response)
+            self.get_logger().info("Requesting controllers...")
+            return True
+        except Exception as e:
+            self.service_in_progress = False
+            self.get_logger().error(f"Failed to send service request: {e}")
+            self.gui_signals.service_error.emit(f"Failed to request controllers: {e}")
+            return False
 
     def handle_controller_response(self, future):
         try:
+            self.service_in_progress = False
             response = future.result()
-            controller_info = [
-                (ctrl.name, ctrl.type, ctrl.state) for ctrl in response.controller
-                if ctrl.state == 'active'  # Only show active controllers
-            ]
-            self.gui_signals.controllers_received.emit(controller_info)
+            
+            if not response:
+                self.get_logger().error("Received empty response from controller service")
+                self.gui_signals.service_error.emit("Empty response from controller service")
+                return
+
+            controller_info = []
+            active_count = 0
+            
+            for ctrl in response.controller:
+                if ctrl.state == 'active':
+                    controller_info.append((ctrl.name, ctrl.type, ctrl.state))
+                    # Store the controller type from the service
+                    self.controller_types[ctrl.name] = ctrl.type
+                    active_count += 1
+            
+            self.get_logger().info(f"Found {active_count} active controllers out of {len(response.controller)} total")
+            
+            if not controller_info:
+                self.gui_signals.service_error.emit("No active controllers found")
+            else:
+                self.gui_signals.controllers_received.emit(controller_info)
+                
         except Exception as e:
+            self.service_in_progress = False
             self.get_logger().error(f"Service call failed: {e}")
+            self.gui_signals.service_error.emit(f"Service call failed: {e}")
 
     def discover_controller_info(self, controller_name: str):
-        """Discover controller information using topic introspection"""
-        # Get all topics and their types
-        topic_names_and_types = self.get_topic_names_and_types()
-        
-        # Find command topics for this controller
-        command_topics = []
-        for topic_name, topic_types in topic_names_and_types:
-            if controller_name in topic_name and ('command' in topic_name or 'trajectory' in topic_name):
-                command_topics.append((topic_name, topic_types[0]))
-        
-        # Determine controller type based on topic names and types
-        controller_type = "unknown"
-        if any('trajectory' in topic for topic, _ in command_topics):
-            controller_type = "joint_trajectory_controller"
-        elif any('command' in topic for topic, _ in command_topics):
-            controller_type = "position_controller"
-        
-        # Create controller info structure
-        controller_info = {
-            'name': controller_name,
-            'type': controller_type,
-            'command_topics': command_topics,
-            'joint_names': self.joint_names  # Use joint names from joint_states
-        }
-        
-        self.current_controller_info = controller_info
-        self.gui_signals.controller_info_received.emit(controller_info)
+        """Discover controller information using service data and topic introspection"""
+        try:
+            # Get controller type from service response
+            controller_type = self.controller_types.get(controller_name, "unknown")
+            
+            # Get all topics and their types
+            topic_names_and_types = self.get_topic_names_and_types()
+            
+            # Find command topics for this controller
+            command_topics = []
+            for topic_name, topic_types in topic_names_and_types:
+                if controller_name in topic_name and ('command' in topic_name or 'trajectory' in topic_name):
+                    command_topics.append((topic_name, topic_types[0]))
+            
+            # Create controller info structure using actual controller type from service
+            controller_info = {
+                'name': controller_name,
+                'type': controller_type,  # Use type from service response
+                'command_topics': command_topics,
+                'joint_names': self.joint_names  # Use joint names from joint_states
+            }
+            
+            self.current_controller_info = controller_info
+            self.gui_signals.controller_info_received.emit(controller_info)
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to discover controller info for {controller_name}: {e}")
+            self.gui_signals.service_error.emit(f"Failed to discover controller info: {e}")
 
     def select_controller(self, controller_name: str):
         """Select and setup publisher for the chosen controller"""
-        self.current_controller = controller_name
+        try:
+            self.current_controller = controller_name
+            self.get_logger().info(f"Selecting controller: {controller_name}")
+            
+            # Discover controller info using service data and topic introspection
+            self.discover_controller_info(controller_name)
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to select controller {controller_name}: {e}")
+            self.gui_signals.service_error.emit(f"Failed to select controller: {e}")
+
+    def determine_message_type_from_controller_type(self, controller_type: str) -> str:
+        """Determine message type based on actual controller type from service"""
+        controller_type_lower = controller_type.lower()
         
-        # Discover controller info using topic introspection
-        self.discover_controller_info(controller_name)
+        # Check for trajectory controllers
+        if ('joint_trajectory_controller' in controller_type_lower or
+            'jointtrajectorycontroller' in controller_type_lower or
+            'trajectory' in controller_type_lower):
+            return 'trajectory'
+        
+        # For all other controller types, use Float64MultiArray
+        return 'position'
 
     def setup_publisher(self, controller_info: dict):
         """Setup publisher based on controller configuration"""
         controller_name = controller_info['name']
+        controller_type = controller_info['type']
         
-        # Destroy existing publisher if any
-        if controller_name in self.command_publishers:
-            self.command_publishers[controller_name].destroy()
-        
-        # Determine the appropriate topic and message type
-        command_topics = controller_info.get('command_topics', [])
-        
-        if command_topics:
-            topic_name, message_type = command_topics[0]
+        try:
+            # Destroy existing publisher if any
+            if controller_name in self.command_publishers:
+                self.command_publishers[controller_name].destroy()
+                del self.command_publishers[controller_name]
             
-            if 'trajectory_msgs/msg/JointTrajectory' in message_type:
+            # Determine message type based on actual controller type
+            message_type = self.determine_message_type_from_controller_type(controller_type)
+            
+            # Determine the appropriate topic
+            command_topics = controller_info.get('command_topics', [])
+            
+            if command_topics:
+                topic_name, _ = command_topics[0]
+            else:
+                # Fallback to naming convention based on message type
+                if message_type == 'trajectory':
+                    topic_name = f"/{controller_name}/joint_trajectory"
+                else:
+                    topic_name = f"/{controller_name}/commands"
+            
+            # Create appropriate publisher based on determined message type
+            if message_type == 'trajectory':
                 self.command_publishers[controller_name] = self.create_publisher(
                     JointTrajectory, topic_name, 10
                 )
-            elif 'std_msgs/msg/Float64MultiArray' in message_type:
+            else:
                 self.command_publishers[controller_name] = self.create_publisher(
                     Float64MultiArray, topic_name, 10
                 )
-        else:
-            # Fallback to naming convention
-            if 'joint_trajectory_controller' in controller_name or 'trajectory' in controller_name:
-                topic = f"/{controller_name}/joint_trajectory"
-                self.command_publishers[controller_name] = self.create_publisher(
-                    JointTrajectory, topic, 10
-                )
-            else:
-                topic = f"/{controller_name}/commands"
-                self.command_publishers[controller_name] = self.create_publisher(
-                    Float64MultiArray, topic, 10
-                )
-        
-        self.get_logger().info(f"Selected controller: {controller_name}")
-        self.gui_signals.controller_selected.emit(controller_name)
+            
+            self.get_logger().info(f"Successfully setup publisher for controller: {controller_name} (type: {controller_type}, message: {message_type})")
+            self.gui_signals.controller_selected.emit(controller_name)
+            
+        except Exception as e:
+            self.get_logger().error(f"Failed to setup publisher for {controller_name}: {e}")
+            self.gui_signals.service_error.emit(f"Failed to setup publisher: {e}")
 
     def send_joint_command(self, joint_positions: list):
         """Send command to the selected controller"""
@@ -151,39 +214,37 @@ class JointControllerNode(Node):
             self.get_logger().warn("No controller selected or publisher not ready")
             return
 
-        publisher = self.command_publishers[self.current_controller]
-        
-        # Determine message type based on controller info
-        is_trajectory = False
-        if self.current_controller_info:
-            command_topics = self.current_controller_info.get('command_topics', [])
-            if command_topics:
-                _, message_type = command_topics[0]
-                is_trajectory = 'trajectory_msgs/msg/JointTrajectory' in message_type
+        try:
+            publisher = self.command_publishers[self.current_controller]
+            
+            # Determine message type based on actual controller type
+            controller_type = self.current_controller_info.get('type', '')
+            message_type = self.determine_message_type_from_controller_type(controller_type)
+            
+            if message_type == 'trajectory':
+                # Send JointTrajectory message
+                msg = JointTrajectory()
+                msg.header.stamp = self.get_clock().now().to_msg()
+                
+                # Use joint names from joint_states
+                msg.joint_names = self.joint_names[:len(joint_positions)]
+                
+                point = JointTrajectoryPoint()
+                point.positions = joint_positions
+                point.time_from_start.sec = 1
+                msg.points = [point]
+                
+                publisher.publish(msg)
+                self.get_logger().info(f"JointTrajectory command sent to {self.current_controller}: {joint_positions}")
             else:
-                is_trajectory = 'joint_trajectory_controller' in self.current_controller or 'trajectory' in self.current_controller
-        
-        if is_trajectory:
-            # Send JointTrajectory message
-            msg = JointTrajectory()
-            msg.header.stamp = self.get_clock().now().to_msg()
+                # Send Float64MultiArray message
+                msg = Float64MultiArray()
+                msg.data = joint_positions
+                publisher.publish(msg)
+                self.get_logger().info(f"Float64MultiArray command sent to {self.current_controller}: {joint_positions}")
             
-            # Use joint names from joint_states
-            msg.joint_names = self.joint_names[:len(joint_positions)]
-            
-            point = JointTrajectoryPoint()
-            point.positions = joint_positions
-            point.time_from_start.sec = 1
-            msg.points = [point]
-            
-            publisher.publish(msg)
-        else:
-            # Send Float64MultiArray message
-            msg = Float64MultiArray()
-            msg.data = joint_positions
-            publisher.publish(msg)
-
-        self.get_logger().info(f"Command sent to {self.current_controller}: {joint_positions}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to send command: {e}")
 
 
 # ROS spinning thread
@@ -203,6 +264,7 @@ class ControllersDialog(QDialog):
         self.setWindowTitle("Select Active Controller")
         self.setModal(True)
         self.selected_controller = None
+        self.resize(500, 300)
         
         layout = QVBoxLayout(self)
         
@@ -210,20 +272,36 @@ class ControllersDialog(QDialog):
         info_label = QLabel("Select a controller to command:")
         layout.addWidget(info_label)
         
-        # Controller list
+        # Controller list with improved display
         self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        
         for name, ctrl_type, state in controllers:
-            item = QListWidgetItem(f"{name}  [{ctrl_type}, {state}]")
+            # Create a more detailed display format
+            display_text = f"{name}\n  Type: {ctrl_type}\n  State: {state}"
+            item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, name)
+            
+            # Add tooltip with full information
+            tooltip = f"Controller: {name}\nType: {ctrl_type}\nState: {state}"
+            item.setToolTip(tooltip)
+            
             self.list_widget.addItem(item)
         
         self.list_widget.itemDoubleClicked.connect(self.on_item_selected)
         layout.addWidget(self.list_widget)
         
+        # Status label
+        status_label = QLabel(f"Found {len(controllers)} active controller(s)")
+        status_label.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(status_label)
+        
         # Buttons
         button_layout = QHBoxLayout()
         select_button = QPushButton("Select")
         select_button.clicked.connect(self.on_select_clicked)
+        select_button.setDefault(True)
+        
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(self.reject)
         
@@ -264,9 +342,9 @@ class MainWindow(QWidget):
         self.controller_label = QLabel("No controller selected")
         controller_layout.addWidget(self.controller_label)
         
-        select_button = QPushButton("Select Controller")
-        select_button.clicked.connect(self.show_controller_dialog)
-        controller_layout.addWidget(select_button)
+        self.select_button = QPushButton("Select Controller")
+        self.select_button.clicked.connect(self.show_controller_dialog)
+        controller_layout.addWidget(self.select_button)
         
         # Controller info display
         self.controller_info_label = QLabel("No controller info")
@@ -325,6 +403,9 @@ class MainWindow(QWidget):
         self.ros_node.gui_signals.controller_info_received.connect(
             self.handle_controller_info_received
         )
+        self.ros_node.gui_signals.service_error.connect(
+            self.handle_service_error
+        )
 
         # Auto-request controllers on startup
         self.ros_node.request_controllers()
@@ -355,9 +436,21 @@ class MainWindow(QWidget):
             self.send_command()
 
     def show_controller_dialog(self):
-        self.ros_node.request_controllers()
+        """Show controller selection dialog"""
+        self.select_button.setEnabled(False)
+        self.select_button.setText("Loading...")
+        
+        # Request controllers with improved error handling
+        success = self.ros_node.request_controllers()
+        if not success:
+            self.select_button.setEnabled(True)
+            self.select_button.setText("Select Controller")
 
     def handle_controllers_received(self, controllers: list):
+        """Handle successful controller list reception"""
+        self.select_button.setEnabled(True)
+        self.select_button.setText("Select Controller")
+        
         if not controllers:
             self.controller_label.setText("No active controllers found")
             return
@@ -365,6 +458,13 @@ class MainWindow(QWidget):
         dialog = ControllersDialog(controllers, self)
         if dialog.exec() == QDialog.Accepted and dialog.selected_controller:
             self.ros_node.select_controller(dialog.selected_controller)
+
+    def handle_service_error(self, error_message: str):
+        """Handle service errors"""
+        self.select_button.setEnabled(True)
+        self.select_button.setText("Select Controller")
+        
+        QMessageBox.warning(self, "Service Error", error_message)
 
     def handle_controller_selected(self, controller_name: str):
         self.current_controller = controller_name
@@ -374,8 +474,9 @@ class MainWindow(QWidget):
         """Handle controller configuration and setup UI accordingly"""
         self.current_controller_info = controller_info
         
-        # Display controller info
-        info_text = f"Type: {controller_info['type']}\n"
+        # Display controller info with actual type from service
+        info_text = f"Name: {controller_info['name']}\n"
+        info_text += f"Type: {controller_info['type']}\n"
         info_text += f"Joint Names: {len(controller_info['joint_names'])}\n"
         info_text += f"Command Topics: {controller_info.get('command_topics', [])}"
         self.controller_info_label.setText(info_text)
