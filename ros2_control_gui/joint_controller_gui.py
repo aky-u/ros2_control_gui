@@ -18,7 +18,7 @@ from PySide6.QtCore import QThread, Qt, QObject, Signal
 # Signal class for Qt-safe updates
 class GuiSignals(QObject):
     joint_state_updated = Signal(dict)  # {joint_name: position}
-    controllers_received = Signal(list)  # [(name, state)]
+    controllers_received = Signal(list)  # [(name, type, state)]
     controller_selected = Signal(str)  # controller_name
     controller_info_received = Signal(dict)  # controller configuration
 
@@ -63,7 +63,7 @@ class JointControllerNode(Node):
         try:
             response = future.result()
             controller_info = [
-                (ctrl.name, ctrl.state) for ctrl in response.controller
+                (ctrl.name, ctrl.type, ctrl.state) for ctrl in response.controller
                 if ctrl.state == 'active'  # Only show active controllers
             ]
             self.gui_signals.controllers_received.emit(controller_info)
@@ -211,8 +211,8 @@ class ControllersDialog(QDialog):
         
         # Controller list
         self.list_widget = QListWidget()
-        for name, state in controllers:
-            item = QListWidgetItem(f"{name}  [{state}]")
+        for name, ctrl_type, state in controllers:
+            item = QListWidgetItem(f"{name}  [{ctrl_type}, {state}]")
             item.setData(Qt.UserRole, name)
             self.list_widget.addItem(item)
         
