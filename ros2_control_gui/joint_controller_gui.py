@@ -1,6 +1,7 @@
 import sys
 import rclpy
 from rclpy.node import Node
+import threading
 
 from std_msgs.msg import String, Float64MultiArray
 from sensor_msgs.msg import JointState
@@ -45,8 +46,13 @@ class JointControllerNode(Node):
         self.joint_names = []
         self.service_in_progress = False
         self.controller_types = {}  # Store controller types from service
+        self._publisher_lock = threading.Lock()  # Thread safety for publishers
+        self._shutdown_requested = False
 
     def joint_state_callback(self, msg: JointState):
+        if self._shutdown_requested:
+            return
+            
         joint_data = dict(zip(msg.name, msg.position))
         self.gui_signals.joint_state_updated.emit(joint_data)
         
@@ -55,6 +61,9 @@ class JointControllerNode(Node):
             self.joint_names = list(msg.name)
 
     def request_controllers(self):
+        if self._shutdown_requested:
+            return False
+            
         if self.service_in_progress:
             self.get_logger().warn("Service call already in progress, please wait...")
             return False
@@ -78,6 +87,9 @@ class JointControllerNode(Node):
             return False
 
     def handle_controller_response(self, future):
+        if self._shutdown_requested:
+            return
+            
         try:
             self.service_in_progress = False
             response = future.result()
@@ -111,6 +123,9 @@ class JointControllerNode(Node):
 
     def discover_controller_info(self, controller_name: str):
         """Discover controller information using service data and topic introspection"""
+        if self._shutdown_requested:
+            return
+            
         try:
             # Get controller type from service response
             controller_type = self.controller_types.get(controller_name, "unknown")
@@ -141,6 +156,9 @@ class JointControllerNode(Node):
 
     def select_controller(self, controller_name: str):
         """Select and setup publisher for the chosen controller"""
+        if self._shutdown_requested:
+            return
+            
         try:
             self.current_controller = controller_name
             self.get_logger().info(f"Selecting controller: {controller_name}")
@@ -165,16 +183,29 @@ class JointControllerNode(Node):
         # For all other controller types, use Float64MultiArray
         return 'position'
 
+    def cleanup_publisher(self, controller_name: str):
+        """Safely cleanup existing publisher with thread safety"""
+        with self._publisher_lock:
+            if controller_name in self.command_publishers:
+                try:
+                    publisher = self.command_publishers[controller_name]
+                    # Don't call destroy() as it can cause issues during shutdown
+                    del self.command_publishers[controller_name]
+                    self.get_logger().info(f"Cleaned up publisher for {controller_name}")
+                except Exception as e:
+                    self.get_logger().warn(f"Error cleaning up publisher for {controller_name}: {e}")
+
     def setup_publisher(self, controller_info: dict):
         """Setup publisher based on controller configuration"""
+        if self._shutdown_requested:
+            return
+            
         controller_name = controller_info['name']
         controller_type = controller_info['type']
         
         try:
-            # Destroy existing publisher if any
-            if controller_name in self.command_publishers:
-                self.command_publishers[controller_name].destroy()
-                del self.command_publishers[controller_name]
+            # Clean up existing publisher
+            self.cleanup_publisher(controller_name)
             
             # Determine message type based on actual controller type
             message_type = self.determine_message_type_from_controller_type(controller_type)
@@ -192,14 +223,15 @@ class JointControllerNode(Node):
                     topic_name = f"/{controller_name}/commands"
             
             # Create appropriate publisher based on determined message type
-            if message_type == 'trajectory':
-                self.command_publishers[controller_name] = self.create_publisher(
-                    JointTrajectory, topic_name, 10
-                )
-            else:
-                self.command_publishers[controller_name] = self.create_publisher(
-                    Float64MultiArray, topic_name, 10
-                )
+            with self._publisher_lock:
+                if message_type == 'trajectory':
+                    self.command_publishers[controller_name] = self.create_publisher(
+                        JointTrajectory, topic_name, 10
+                    )
+                else:
+                    self.command_publishers[controller_name] = self.create_publisher(
+                        Float64MultiArray, topic_name, 10
+                    )
             
             self.get_logger().info(f"Successfully setup publisher for controller: {controller_name} (type: {controller_type}, message: {message_type})")
             self.gui_signals.controller_selected.emit(controller_name)
@@ -210,51 +242,87 @@ class JointControllerNode(Node):
 
     def send_joint_command(self, joint_positions: list):
         """Send command to the selected controller"""
+        if self._shutdown_requested:
+            return
+            
         if not self.current_controller or self.current_controller not in self.command_publishers:
             self.get_logger().warn("No controller selected or publisher not ready")
             return
 
         try:
-            publisher = self.command_publishers[self.current_controller]
-            
-            # Determine message type based on actual controller type
-            controller_type = self.current_controller_info.get('type', '')
-            message_type = self.determine_message_type_from_controller_type(controller_type)
-            
-            if message_type == 'trajectory':
-                # Send JointTrajectory message
-                msg = JointTrajectory()
-                msg.header.stamp = self.get_clock().now().to_msg()
+            with self._publisher_lock:
+                if self.current_controller not in self.command_publishers:
+                    return
+                    
+                publisher = self.command_publishers[self.current_controller]
                 
-                # Use joint names from joint_states
-                msg.joint_names = self.joint_names[:len(joint_positions)]
+                # Determine message type based on actual controller type
+                controller_type = self.current_controller_info.get('type', '')
+                message_type = self.determine_message_type_from_controller_type(controller_type)
                 
-                point = JointTrajectoryPoint()
-                point.positions = joint_positions
-                point.time_from_start.sec = 1
-                msg.points = [point]
-                
-                publisher.publish(msg)
-                self.get_logger().info(f"JointTrajectory command sent to {self.current_controller}: {joint_positions}")
-            else:
-                # Send Float64MultiArray message
-                msg = Float64MultiArray()
-                msg.data = joint_positions
-                publisher.publish(msg)
-                self.get_logger().info(f"Float64MultiArray command sent to {self.current_controller}: {joint_positions}")
+                if message_type == 'trajectory':
+                    # Send JointTrajectory message
+                    msg = JointTrajectory()
+                    msg.header.stamp = self.get_clock().now().to_msg()
+                    
+                    # Use joint names from joint_states
+                    msg.joint_names = self.joint_names[:len(joint_positions)]
+                    
+                    point = JointTrajectoryPoint()
+                    point.positions = joint_positions
+                    point.time_from_start.sec = 1
+                    msg.points = [point]
+                    
+                    publisher.publish(msg)
+                    self.get_logger().info(f"JointTrajectory command sent to {self.current_controller}: {joint_positions}")
+                else:
+                    # Send Float64MultiArray message
+                    msg = Float64MultiArray()
+                    msg.data = joint_positions
+                    publisher.publish(msg)
+                    self.get_logger().info(f"Float64MultiArray command sent to {self.current_controller}: {joint_positions}")
             
         except Exception as e:
             self.get_logger().error(f"Failed to send command: {e}")
 
+    def shutdown(self):
+        """Safely shutdown the node"""
+        self._shutdown_requested = True
+        
+        # Clean up all publishers
+        with self._publisher_lock:
+            controller_names = list(self.command_publishers.keys())
+            for controller_name in controller_names:
+                try:
+                    del self.command_publishers[controller_name]
+                except Exception as e:
+                    self.get_logger().warn(f"Error during shutdown cleanup: {e}")
+            self.command_publishers.clear()
 
-# ROS spinning thread
+
+# ROS spinning thread with improved error handling
 class RosSpinThread(QThread):
     def __init__(self, node: Node):
         super().__init__()
         self.node = node
+        self._shutdown_requested = False
 
     def run(self):
-        rclpy.spin(self.node)
+        try:
+            while not self._shutdown_requested and rclpy.ok():
+                try:
+                    rclpy.spin_once(self.node, timeout_sec=0.1)
+                except Exception as e:
+                    if not self._shutdown_requested:
+                        print(f"ROS spin error: {e}")
+                    break
+        except Exception as e:
+            if not self._shutdown_requested:
+                print(f"ROS thread error: {e}")
+
+    def shutdown(self):
+        """Request shutdown of the thread"""
+        self._shutdown_requested = True
 
 
 # Dialog to show and select controllers
@@ -594,10 +662,12 @@ def main():
     try:
         sys.exit(app.exec())
     finally:
+        # Proper shutdown sequence
+        ros_thread.shutdown()
+        ros_node.shutdown()
+        ros_thread.wait(timeout=2000)  # Wait up to 2 seconds
         ros_node.destroy_node()
         rclpy.shutdown()
-        ros_thread.quit()
-        ros_thread.wait()
 
 
 if __name__ == "__main__":
