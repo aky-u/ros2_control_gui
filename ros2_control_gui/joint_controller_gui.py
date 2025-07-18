@@ -452,11 +452,21 @@ class MainWindow(QWidget):
         self.joint_group.setEnabled(False)
         self.layout.addWidget(self.joint_group)
 
-        # Command button
+        # Command buttons section
+        command_buttons_layout = QHBoxLayout()
+        
         self.command_button = QPushButton("Send Command")
         self.command_button.clicked.connect(self.send_command)
         self.command_button.setEnabled(False)
-        self.layout.addWidget(self.command_button)
+        command_buttons_layout.addWidget(self.command_button)
+        
+        self.reset_button = QPushButton("Reset All")
+        self.reset_button.clicked.connect(self.reset_all_sliders)
+        self.reset_button.setEnabled(False)
+        self.reset_button.setStyleSheet("QPushButton { background-color: #f0f0f0; }")
+        command_buttons_layout.addWidget(self.reset_button)
+        
+        self.layout.addLayout(command_buttons_layout)
 
         # Connect ROS-to-GUI signals
         self.ros_node.gui_signals.joint_state_updated.connect(
@@ -500,6 +510,17 @@ class MainWindow(QWidget):
 
     def send_continuous_command(self):
         """Send command in continuous mode"""
+        if self.current_controller and self.current_controller_info:
+            self.send_command()
+
+    def reset_all_sliders(self):
+        """Reset all sliders to zero position"""
+        for joint_name, widgets in self.sliders.items():
+            widgets['slider'].setValue(0)
+        
+        self.get_logger().info("Reset all sliders to zero position")
+        
+        # Optionally send zero command immediately after reset
         if self.current_controller and self.current_controller_info:
             self.send_command()
 
@@ -562,6 +583,7 @@ class MainWindow(QWidget):
         
         self.joint_group.setEnabled(True)
         self.command_button.setEnabled(True)
+        self.reset_button.setEnabled(True)
 
     def clear_sliders(self):
         """Clear all existing sliders"""
