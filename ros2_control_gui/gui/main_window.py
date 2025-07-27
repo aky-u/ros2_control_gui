@@ -31,6 +31,9 @@ class MainWindow(QWidget):
         self._setup_ui()
         self._connect_signals()
         
+        # Update YAML config status on startup (in case it was loaded via parameter)
+        self._update_yaml_config_status()
+        
         # Auto-request controllers on startup
         self.ros_node.request_controllers()
     
@@ -158,8 +161,7 @@ class MainWindow(QWidget):
         if file_path:
             success = self.ros_node.load_yaml_config(file_path)
             if success:
-                self.yaml_file_label.setText(f"Loaded: {os.path.basename(file_path)}")
-                self.yaml_file_label.setToolTip(file_path)
+                self._update_yaml_config_status()
                 self.get_logger().info(f"Successfully loaded YAML config: {file_path}")
                 
                 # If a controller is already selected, refresh its info
@@ -167,6 +169,7 @@ class MainWindow(QWidget):
                     self.ros_node.discover_controller_info(self.current_controller)
             else:
                 QMessageBox.warning(self, "Error", f"Failed to load YAML file: {file_path}")
+                self._update_yaml_config_status()
     
     def show_controller_dialog(self):
         """Show controller selection dialog"""
@@ -287,6 +290,27 @@ class MainWindow(QWidget):
             child = self.joint_layout.takeAt(0)
             if child.widget():
                 child.widget().deleteLater()
+    
+    def _update_yaml_config_status(self):
+        """Update the YAML config status display"""
+        if self.ros_node.yaml_config.is_loaded():
+            config_filename = self.ros_node.yaml_config.get_config_filename()
+            param_file = self.ros_node.get_config_file_parameter()
+            
+            if param_file and param_file.strip():
+                self.yaml_file_label.setText(f"Config loaded via parameter: {config_filename}")
+                self.yaml_file_label.setStyleSheet("color: blue;")
+            else:
+                self.yaml_file_label.setText(f"Config loaded: {config_filename}")
+                self.yaml_file_label.setStyleSheet("color: green;")
+        else:
+            param_file = self.ros_node.get_config_file_parameter()
+            if param_file and param_file.strip():
+                self.yaml_file_label.setText(f"Config file parameter set but failed to load: {param_file}")
+                self.yaml_file_label.setStyleSheet("color: red;")
+            else:
+                self.yaml_file_label.setText("No YAML config loaded")
+                self.yaml_file_label.setStyleSheet("color: black;")
     
     def on_continuous_toggled(self, checked: bool):
         """Handle continuous mode toggle"""

@@ -32,6 +32,9 @@ class JointControllerNode(Node):
     def __init__(self):
         super().__init__('joint_controller_node')
         
+        # Declare ROS parameters
+        self.declare_parameter('config_file', '')
+        
         # ROS subscriptions and clients
         self.joint_state_sub = self.create_subscription(
             JointState, "/joint_states", self.joint_state_callback, 10
@@ -54,6 +57,9 @@ class JointControllerNode(Node):
         self.controller_types = {}  # Store controller types from service
         self._publisher_lock = threading.Lock()
         self._shutdown_requested = False
+        
+        # Load YAML config from parameter if specified
+        self._load_config_from_parameter()
 
     def joint_state_callback(self, msg: JointState):
         """Handle incoming joint state messages"""
@@ -262,3 +268,32 @@ class JointControllerNode(Node):
         
         with self._publisher_lock:
             self.command_publishers.clear()
+
+    def _load_config_from_parameter(self):
+        """Load YAML configuration from ROS parameter if specified"""
+        try:
+            config_file = self.get_parameter('config_file').get_parameter_value().string_value
+            if config_file and config_file.strip():
+                # Expand relative paths and environment variables
+                import os
+                config_file = os.path.expanduser(os.path.expandvars(config_file))
+                
+                if os.path.exists(config_file):
+                    success = self.yaml_config.load_config(config_file)
+                    if success:
+                        self.get_logger().info(f"Successfully loaded YAML config from parameter: {config_file}")
+                    else:
+                        self.get_logger().error(f"Failed to load YAML config from parameter: {config_file}")
+                else:
+                    self.get_logger().error(f"YAML config file specified in parameter does not exist: {config_file}")
+            else:
+                self.get_logger().info("No config file specified in parameters")
+        except Exception as e:
+            self.get_logger().error(f"Error loading config from parameter: {e}")
+
+    def get_config_file_parameter(self) -> str:
+        """Get the config file parameter value"""
+        try:
+            return self.get_parameter('config_file').get_parameter_value().string_value
+        except Exception:
+            return ""
