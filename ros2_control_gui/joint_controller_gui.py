@@ -2,6 +2,10 @@ import sys
 import rclpy
 from rclpy.node import Node
 import threading
+import yaml
+import os
+import signal
+from pathlib import Path
 
 from std_msgs.msg import String, Float64MultiArray
 from sensor_msgs.msg import JointState
@@ -12,7 +16,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton,
     QHBoxLayout, QLabel, QSlider, QDialog, QListWidget,
     QListWidgetItem, QSpinBox, QDoubleSpinBox, QGroupBox,
-    QCheckBox, QMessageBox
+    QCheckBox, QMessageBox, QFileDialog
 )
 from PySide6.QtCore import QThread, Qt, QObject, Signal, QTimer
 
@@ -43,11 +47,15 @@ class JointControllerNode(Node):
         self.command_publishers = {}
         self.current_controller = None
         self.current_controller_info = None
-        self.joint_names = []
+        self.joint_names = []  # Joint names from joint_states (for reference only)
         self.service_in_progress = False
         self.controller_types = {}  # Store controller types from service
         self._publisher_lock = threading.Lock()  # Thread safety for publishers
         self._shutdown_requested = False
+        
+        # YAML configuration
+        self.yaml_config_file = None
+        self.yaml_config_data = None
 
     def joint_state_callback(self, msg: JointState):
         if self._shutdown_requested:
@@ -121,14 +129,120 @@ class JointControllerNode(Node):
             self.get_logger().error(f"Service call failed: {e}")
             self.gui_signals.service_error.emit(f"Service call failed: {e}")
 
+    def load_yaml_config(self, yaml_file_path: str):
+        """Load YAML configuration file"""
+        try:
+            with open(yaml_file_path, 'r') as f:
+                self.yaml_config_data = yaml.safe_load(f)
+            self.yaml_config_file = yaml_file_path
+            self.get_logger().info(f"Loaded YAML config from: {yaml_file_path}")
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to load YAML config from {yaml_file_path}: {e}")
+            return False
+
+    def get_controller_joint_names_from_yaml(self, controller_name: str):
+        """Get joint names for a controller from loaded YAML config"""
+        if not self.yaml_config_data:
+            return None
+            
+        # Common YAML structures for ROS2 control configurations
+        search_paths = [
+            # Direct controller name as key (most common)
+            [controller_name, "ros__parameters"],
+            [controller_name],
+            # Under controller_manager section
+            ["controller_manager", "ros__parameters", controller_name],
+            # Under controllers section
+            ["controllers", controller_name],
+            # Under ros__parameters section
+            ["ros__parameters", controller_name],
+            # Try with / prefix (some configs use this)
+            [f"/{controller_name}", "ros__parameters"],
+            [f"/{controller_name}"],
+        ]
+        
+        for path in search_paths:
+            result = self.get_nested_value(self.yaml_config_data, path)
+            if result and isinstance(result, dict):
+                joint_names = self.extract_joint_names_from_config(result)
+                if joint_names:
+                    self.get_logger().debug(f"Found joint config at path {path}: {joint_names}")
+                    return joint_names
+        
+        # Try to find any controller config that might match (recursive search)
+        result = self.find_controller_in_nested_config(self.yaml_config_data, controller_name)
+        if result:
+            self.get_logger().debug(f"Found joint config via recursive search: {result}")
+        
+        return result
+
+    def get_nested_value(self, data: dict, path: list):
+        """Get nested value from dictionary using path list"""
+        current = data
+        for key in path:
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                return None
+        return current
+
+    def extract_joint_names_from_config(self, config: dict):
+        """Extract joint names from controller configuration"""
+        # Common keys where joint names are stored
+        joint_keys = ['joints', 'joint_names', 'controlled_joints']
+        
+        for key in joint_keys:
+            if key in config:
+                joints = config[key]
+                if isinstance(joints, list) and joints:
+                    return joints
+                elif isinstance(joints, str):
+                    # Sometimes joints are stored as space/comma separated string
+                    return [j.strip() for j in joints.replace(',', ' ').split() if j.strip()]
+        
+        return None
+
+    def find_controller_in_nested_config(self, config: dict, controller_name: str):
+        """Recursively search for controller configuration in nested structure"""
+        if isinstance(config, dict):
+            for key, value in config.items():
+                if key == controller_name and isinstance(value, dict):
+                    joint_names = self.extract_joint_names_from_config(value)
+                    if joint_names:
+                        return joint_names
+                elif isinstance(value, dict):
+                    result = self.find_controller_in_nested_config(value, controller_name)
+                    if result:
+                        return result
+        
+        return None
+
     def discover_controller_info(self, controller_name: str):
-        """Discover controller information using service data and topic introspection"""
+        """Discover controller information using loaded YAML config and topic introspection"""
         if self._shutdown_requested:
             return
             
         try:
             # Get controller type from service response
             controller_type = self.controller_types.get(controller_name, "unknown")
+            
+            # Try to get joint names from loaded YAML config
+            if self.yaml_config_data:
+                controller_joint_names = self.get_controller_joint_names_from_yaml(controller_name)
+                if controller_joint_names:
+                    self.get_logger().info(f"Using joint names from YAML config for {controller_name}: {controller_joint_names}")
+                    config_source = f"YAML: {os.path.basename(self.yaml_config_file)}"
+                else:
+                    # Fallback to joint_states names with info message (not warning)
+                    controller_joint_names = self.joint_names.copy()
+                    self.get_logger().info(f"Controller {controller_name} not found in YAML config, using joint_states as fallback: {controller_joint_names}")
+                    config_source = "joint_states (controller not in YAML)"
+            else:
+                # No YAML config loaded, use joint_states
+                controller_joint_names = self.joint_names.copy()
+                self.get_logger().info(f"No YAML config loaded, using joint_states for {controller_name}: {controller_joint_names}")
+                config_source = "joint_states (no YAML loaded)"
             
             # Get all topics and their types
             topic_names_and_types = self.get_topic_names_and_types()
@@ -139,12 +253,13 @@ class JointControllerNode(Node):
                 if controller_name in topic_name and ('command' in topic_name or 'trajectory' in topic_name):
                     command_topics.append((topic_name, topic_types[0]))
             
-            # Create controller info structure using actual controller type from service
+            # Create controller info structure
             controller_info = {
                 'name': controller_name,
-                'type': controller_type,  # Use type from service response
+                'type': controller_type,
                 'command_topics': command_topics,
-                'joint_names': self.joint_names  # Use joint names from joint_states
+                'joint_names': controller_joint_names,
+                'config_source': config_source
             }
             
             self.current_controller_info = controller_info
@@ -265,8 +380,9 @@ class JointControllerNode(Node):
                     msg = JointTrajectory()
                     msg.header.stamp = self.get_clock().now().to_msg()
                     
-                    # Use joint names from joint_states
-                    msg.joint_names = self.joint_names[:len(joint_positions)]
+                    # Use actual controller joint names from config
+                    controller_joint_names = self.current_controller_info.get('joint_names', [])
+                    msg.joint_names = controller_joint_names
                     
                     point = JointTrajectoryPoint()
                     point.positions = joint_positions
@@ -274,7 +390,7 @@ class JointControllerNode(Node):
                     msg.points = [point]
                     
                     publisher.publish(msg)
-                    self.get_logger().info(f"JointTrajectory command sent to {self.current_controller}: {joint_positions}")
+                    self.get_logger().info(f"JointTrajectory command sent to {self.current_controller} with joints {controller_joint_names}: {joint_positions}")
                 else:
                     # Send Float64MultiArray message
                     msg = Float64MultiArray()
@@ -407,6 +523,17 @@ class MainWindow(QWidget):
         controller_group = QGroupBox("Controller Selection")
         controller_layout = QVBoxLayout()
         
+        # YAML config file selection
+        yaml_layout = QHBoxLayout()
+        self.yaml_file_label = QLabel("No YAML config loaded")
+        yaml_layout.addWidget(self.yaml_file_label)
+        
+        self.load_yaml_button = QPushButton("Load YAML Config")
+        self.load_yaml_button.clicked.connect(self.load_yaml_config)
+        yaml_layout.addWidget(self.load_yaml_button)
+        
+        controller_layout.addLayout(yaml_layout)
+        
         self.controller_label = QLabel("No controller selected")
         controller_layout.addWidget(self.controller_label)
         
@@ -488,6 +615,28 @@ class MainWindow(QWidget):
         # Auto-request controllers on startup
         self.ros_node.request_controllers()
 
+    def load_yaml_config(self):
+        """Load YAML configuration file through file dialog"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Controller YAML Configuration",
+            "",
+            "YAML files (*.yaml *.yml);;All files (*.*)"
+        )
+        
+        if file_path:
+            success = self.ros_node.load_yaml_config(file_path)
+            if success:
+                self.yaml_file_label.setText(f"Loaded: {os.path.basename(file_path)}")
+                self.yaml_file_label.setToolTip(file_path)
+                self.get_logger().info(f"Successfully loaded YAML config: {file_path}")
+                
+                # If a controller is already selected, refresh its info to use the new config
+                if self.current_controller:
+                    self.ros_node.discover_controller_info(self.current_controller)
+            else:
+                QMessageBox.warning(self, "Error", f"Failed to load YAML file: {file_path}")
+
     def on_continuous_toggled(self, checked: bool):
         """Handle continuous mode toggle"""
         if checked:
@@ -546,6 +695,18 @@ class MainWindow(QWidget):
             
         dialog = ControllersDialog(controllers, self)
         if dialog.exec() == QDialog.Accepted and dialog.selected_controller:
+            # After selecting controller, prompt for YAML config if not loaded
+            if not self.ros_node.yaml_config_data:
+                reply = QMessageBox.question(
+                    self, 
+                    "YAML Configuration", 
+                    "No YAML configuration loaded. Would you like to load a controller configuration file?\n\nThis will ensure correct joint names and ordering.",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+                if reply == QMessageBox.Yes:
+                    self.load_yaml_config()
+            
             self.ros_node.select_controller(dialog.selected_controller)
 
     def handle_service_error(self, error_message: str):
@@ -563,10 +724,14 @@ class MainWindow(QWidget):
         """Handle controller configuration and setup UI accordingly"""
         self.current_controller_info = controller_info
         
-        # Display controller info with actual type from service
+        # Display controller info with source information
+        controller_joint_names = controller_info.get('joint_names', [])
+        config_source = controller_info.get('config_source', 'unknown')
+        
         info_text = f"Name: {controller_info['name']}\n"
         info_text += f"Type: {controller_info['type']}\n"
-        info_text += f"Joint Names: {len(controller_info['joint_names'])}\n"
+        info_text += f"Controller Joints ({len(controller_joint_names)}): {controller_joint_names}\n"
+        info_text += f"Config Source: {config_source}\n"
         info_text += f"Command Topics: {controller_info.get('command_topics', [])}"
         self.controller_info_label.setText(info_text)
         
@@ -576,9 +741,8 @@ class MainWindow(QWidget):
         # Clear existing sliders
         self.clear_sliders()
         
-        # Create sliders based on joint names
-        joint_names = controller_info['joint_names']
-        for i, joint_name in enumerate(joint_names):
+        # Create sliders based on controller's actual joint names
+        for i, joint_name in enumerate(controller_joint_names):
             self.create_slider(joint_name, i)
         
         self.joint_group.setEnabled(True)
@@ -645,15 +809,19 @@ class MainWindow(QWidget):
         if not self.current_controller or not self.current_controller_info:
             return
             
-        # Get current slider values in the correct order
-        joint_names = self.current_controller_info['joint_names']
-        joint_positions = [0.0] * len(joint_names)
+        # Get current slider values in the correct order based on controller's joint names
+        controller_joint_names = self.current_controller_info.get('joint_names', [])
+        joint_positions = []
         
-        for joint_name, widgets in self.sliders.items():
-            if joint_name in joint_names:
-                position = widgets['slider'].value() / 100.0
-                index = joint_names.index(joint_name)
-                joint_positions[index] = position
+        # Build the command array in the exact order expected by the controller
+        for joint_name in controller_joint_names:
+            if joint_name in self.sliders:
+                position = self.sliders[joint_name]['slider'].value() / 100.0
+                joint_positions.append(position)
+            else:
+                # If a joint is not found in sliders, use zero as default
+                joint_positions.append(0.0)
+                self.get_logger().warn(f"Joint {joint_name} not found in sliders, using 0.0")
         
         # Send command to ROS node
         self.ros_node.send_joint_command(joint_positions)
@@ -670,6 +838,13 @@ class MainWindow(QWidget):
 
 
 def main():
+    # Handle Ctrl+C gracefully
+    def signal_handler(sig, frame):
+        print("\nShutdown requested via Ctrl+C...")
+        QApplication.quit()
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
     rclpy.init()
 
     ros_node = JointControllerNode()
@@ -677,20 +852,32 @@ def main():
     ros_thread.start()
 
     app = QApplication(sys.argv)
+    
+    # Allow Ctrl+C to work by processing events periodically
+    timer = QTimer()
+    timer.timeout.connect(lambda: None)  # Just process events
+    timer.start(100)  # Process every 100ms
+    
     window = MainWindow(ros_node)
     window.resize(800, 700)
     window.show()
 
     try:
-        sys.exit(app.exec())
+        exit_code = app.exec()
+        print("GUI closed normally")
+        return exit_code
+    except KeyboardInterrupt:
+        print("Caught KeyboardInterrupt, shutting down...")
     finally:
         # Proper shutdown sequence
+        print("Shutting down ROS node and thread...")
         ros_thread.shutdown()
         ros_node.shutdown()
         ros_thread.wait(timeout=2000)  # Wait up to 2 seconds
         ros_node.destroy_node()
         rclpy.shutdown()
+        print("Shutdown complete")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
