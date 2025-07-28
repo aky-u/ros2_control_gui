@@ -4,7 +4,6 @@ This package provides the GUI to deal with the ros2 controllers.
 
 ## Features
 
-- **Modular Architecture**: Well-organized codebase for easy extension with new controller types
 - **YAML Configuration Loading**: Load controller configurations from YAML files through GUI file dialog
 - **Automatic Controller Discovery**: Automatically discovers active controllers
 - **Plugin-based Controller Support**: Easy to add new controller types via the factory pattern
@@ -14,13 +13,13 @@ This package provides the GUI to deal with the ros2 controllers.
 
 ## Requirements
 
-- ROS 2 (tested with Humble/Iron)
+- ROS 2 (tested with Humble)
 - PySide6
 - PyYAML
 - ros2_control framework
 - controller_manager
 
-## Build
+## Getting Started
 
 ```bash
 mkdir exp_ws/src -p
@@ -28,7 +27,11 @@ cd exp_ws/src
 git clone https://github.com/aky-u/ros2_control_gui.git
 cd ..
 colcon build --symlink-install
+source install/setup.bash
+ros2 launch ros2_control_gui example.launch.py 
 ```
+
+![alt text](docs/demo.gif)
 
 ## Project Structure
 
