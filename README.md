@@ -114,8 +114,6 @@ self.controller_mapping['my_new_type'] = MyNewController
 ## Known bugs
 
 - Joint trajectory command does not work.
-- The order of sliding bar depends on the order of the joint names in `joint_states` topic, not following the controllers definition.
-- The size of the commanded vector depends on the number of the joints in `joint_states` topic, which is not always correct.
 
 ## Memo
 
