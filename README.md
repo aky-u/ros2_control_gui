@@ -123,3 +123,13 @@ self.controller_mapping['my_new_type'] = MyNewController
 pip install PySide6
 pip install qt6-tools
 ```
+
+```bash
+sudo apt update
+sudo apt install --reinstall \
+    libxcb-xinerama0 \
+    libxcb-cursor0 \
+    libxcb-randr0 \
+    libxcb-xkb1 \
+    libxkbcommon-x11-0
+```
